@@ -508,6 +508,12 @@
     font-style: normal; font-size: 6px; font-weight: 600; letter-spacing: .13em; color: var(--red);
     border: 1px solid rgba(255,43,70,.4); padding: 1px 3px; margin-left: 5px; vertical-align: 1px;
   }
+  .standing-row .sr-name em.sr-pen {
+    display: inline-block; color: #fff; background: var(--red); border-color: var(--red);
+    font-family: var(--tech); font-size: 8px; font-weight: 600; letter-spacing: .03em;
+    padding: 1px 5px; margin-left: 6px; vertical-align: 2px; line-height: 1.1;
+    box-shadow: 0 0 8px rgba(255,43,70,.35);
+  }
   .standing-row .sr-team { font-size: 7px; letter-spacing: .1em; color: #67798a; }
   .standing-row .sr-time { width: 82px; text-align: right; font-size: 9px; color: #b8c7d4; }
   .standing-row .sr-time.running { font-size: 8px; letter-spacing: .08em; color: #ffbf66; }
@@ -3539,6 +3545,8 @@ const player = {
   speed: 0,
   forwardSpeed: 0,
   lateral: 0,
+  latVel: 0,
+  prevLateral: 0,
   sampleIndex: 0,
   u: 0,
   uRel: .99,
@@ -3563,6 +3571,8 @@ const player = {
   offTrackTimer: 0,
   trackLimitCooldown: 0,
   trackLimitGrace: 0,
+  pushedOffTimer: 0,
+  pushedOff: false,
   rawFinishTime: null,
   veerTimer: 0,
   damageSmokeTimer: 0,
@@ -3622,6 +3632,8 @@ function placeCarsOnGrid() {
       player.brake = 0;
       player.handbrake = 0;
       player.lateral = slot.lateral;
+      player.prevLateral = slot.lateral;
+      player.latVel = 0;
       player.sampleIndex = s.i;
       player.u = u;
       player.uRel = ((u - track.startU) % 1 + 1) % 1;
@@ -3646,6 +3658,8 @@ function placeCarsOnGrid() {
       player.offTrackTimer = 0;
       player.trackLimitCooldown = 0;
       player.trackLimitGrace = 0;
+      player.pushedOffTimer = 0;
+      player.pushedOff = false;
       player.rawFinishTime = null;
       player.criticalWarned = false;
       player.veerTimer = 0;
@@ -3684,6 +3698,7 @@ function placeCarsOnGrid() {
           penaltyCooldown: 0,
           veerTimer: 0,
           veerVel: 0,
+          latVel: 0,
           damageSmokeTimer: 0,
           form: 1,
           cornerForm: 1,
@@ -3718,6 +3733,7 @@ function placeCarsOnGrid() {
       entry.penaltyCooldown = 0;
       entry.veerTimer = 0;
       entry.veerVel = 0;
+      entry.latVel = 0;
       entry.damageSmokeTimer = 0;
       entry.form = rand(.962, 1.038);
       entry.cornerForm = rand(.988, 1.025);
@@ -3913,6 +3929,21 @@ function bumpAI(entry, closing) {
   entry.veerTimer = Math.max(entry.veerTimer, .3);
 }
 
+// Blame only the car that actually caused the contact. The player keeps the
+// benefit of the doubt on a genuine racing rub; a clear AI dive-bomb or
+// rear-end puts the penalty on the AI instead.
+function penalizeContact(entry, blame, rearEnd) {
+  if (blame === 'player') {
+    if (player.penaltyCooldown > 0) return;
+    giveTimePenalty(player, rearEnd ? 3 : 1.5, rearEnd ? 'CAUSING A COLLISION' : 'CONTACT');
+    player.penaltyCooldown = rearEnd ? 5 : 3;
+  } else if (blame === 'ai') {
+    if (entry.penaltyCooldown > 0) return;
+    giveTimePenalty(entry, rearEnd ? 3 : 2, 'CAUSING A COLLISION');
+    entry.penaltyCooldown = 5;
+  }
+}
+
 function veerAI(entry, side, strength) {
   const amt = clamp(strength, 0, 1);
   const dir = side || 1;
@@ -4082,6 +4113,11 @@ function stepPlayerPhysics(dt) {
     }
   }
 
+  // Track-relative lateral speed, used by contact blame to tell a genuine
+  // side-swipe from normal cornering slip.
+  p.latVel = dt > 0 ? clamp((p.lateral - p.prevLateral) / dt, -45, 45) : 0;
+  p.prevLateral = p.lateral;
+
   p.offroad = Math.abs(lateral) > TRACK_HALF + 1.18;
   p.onCurb = Math.abs(p.lateral) > TRACK_HALF && Math.abs(p.lateral) <= TRACK_HALF + 1.18;
   p.forwardSpeed = p.vel.dot(nearTangent(near));
@@ -4090,13 +4126,18 @@ function stepPlayerPhysics(dt) {
   state.topSpeed = Math.max(state.topSpeed, p.speed * 3.6);
   p.penaltyCooldown = Math.max(0, p.penaltyCooldown - dt);
   p.trackLimitGrace = Math.max(0, p.trackLimitGrace - dt);
+  p.pushedOffTimer = Math.max(0, p.pushedOffTimer - dt);
+  // Leaving the road shortly after being hit counts as being pushed off, and
+  // stays protected for the whole excursion until the car is back on tarmac.
+  if (p.offroad && p.pushedOffTimer > 0) p.pushedOff = true;
+  if (!p.offroad) p.pushedOff = false;
 
   if (canDrive && !p.finished) {
     const overLimits = p.offroad;
     if (p.trackLimitCooldown > 0) {
       p.trackLimitCooldown = Math.max(0, p.trackLimitCooldown - dt);
       p.offTrackTimer = 0;
-    } else if (overLimits && p.trackLimitGrace <= 0) {
+    } else if (overLimits && !p.pushedOff && p.trackLimitGrace <= 0 && p.pushedOffTimer <= 0) {
       // Keep counting while the car is fully off the track, even when it is
       // scraping the barrier or has scrubbed off most of its speed. Barrier
       // contact sets veerTimer and shedding speed used to stop this timer, so
@@ -4326,6 +4367,7 @@ function updateAI(dt) {
     targetOffset = clamp(targetOffset, -4.3, 4.3);
     if (launchBlend < 1) targetOffset = lerp(entry.startOffset, targetOffset, launchBlend);
 
+    const offsetBefore = entry.offset;
     if (entry.veerTimer > 0) {
       // Running wide after contact: hold the line and let the slide play out.
       entry.veerTimer = Math.max(0, entry.veerTimer - dt);
@@ -4355,6 +4397,10 @@ function updateAI(dt) {
         emitImpactDebris(entry.car.root.position, bs, sign, 4);
       }
     }
+
+    // How fast the AI is moving across the track. Contact blame uses this to
+    // tell a genuine rear-end apart from an AI chopping across someone's nose.
+    entry.latVel = dt > 0 ? clamp((entry.offset - offsetBefore) / dt, -45, 45) : 0;
 
     const s = sampleAt(entry.u);
     const pos = s.pos.clone().addScaledVector(s.right, entry.offset);
@@ -4484,19 +4530,58 @@ function handleCarCollisions(dt) {
     const relAlong = dx * tanx + dz * tanz;         // + means player is ahead
     const relLateral = dx * rightx + dz * rightz;
     const playerAhead = relAlong > 0;
-    if (playerAhead) player.trackLimitGrace = Math.max(player.trackLimitGrace, 2.4);
     const side = relLateral >= 0 ? 1 : -1;
 
     const playerTanSpeed = player.vel.x * tanx + player.vel.z * tanz;
     const alongClosing = playerAhead ? entry.speed - playerTanSpeed : playerTanSpeed - entry.speed;
+    // Use the AI's real transverse speed as well as its forward speed, so a
+    // sideways chop registers as a real hit instead of a harmless rub.
+    const aiLatVel = entry.latVel || 0;
+    const aiVx = tanx * entry.speed + rightx * aiLatVel;
+    const aiVz = tanz * entry.speed + rightz * aiLatVel;
+    const playerSideVel = player.latVel || 0;
     // Impact is measured along the contact normal. Two cars running side by side
     // at the same speed should rub, not exchange damage every half second.
-    const relVx = player.vel.x - tanx * entry.speed;
-    const relVz = player.vel.z - tanz * entry.speed;
+    const relVx = player.vel.x - aiVx;
+    const relVz = player.vel.z - aiVz;
     const impact = Math.max(0, -(relVx * nx + relVz * nz));
     const canReact = player.collisionCooldown <= 0 && entry.collisionCooldown <= 0;
     // A rear-end needs the two cars to be roughly in line; otherwise it is a side hit.
     const rearEnd = Math.abs(relAlong) > .55 && Math.abs(relLateral) < 1.85 && impact > 1.5;
+
+    // Work out who moved into whom. A rear-end is nearly always the following
+    // car's fault unless the car in front chopped across its nose. For side
+    // contact, compare the two cars' lateral movement instead of just blaming
+    // whoever is behind.
+    const playerTowardAI = Math.max(0, -(playerSideVel * side));
+    const aiTowardPlayer = Math.max(0, aiLatVel * side);
+    let blame = null;
+    if (rearEnd) {
+      if (playerAhead) {
+        // The AI is behind and ran into the player.
+        if (alongClosing > .35 || impact > 2.4) blame = 'ai';
+      } else if (alongClosing > .5) {
+        // The player is behind. Unless the AI cut across their nose, the
+        // player is the one who ran into the back of them.
+        const aiCutAcross = Math.abs(relLateral) > .5 &&
+          aiTowardPlayer > playerTowardAI + .9 && aiTowardPlayer > 1.6;
+        blame = aiCutAcross ? 'ai' : 'player';
+      }
+    } else {
+      if (playerTowardAI > aiTowardPlayer + .8 && playerTowardAI > 1.2) blame = 'player';
+      else if (aiTowardPlayer > playerTowardAI + .5 && aiTowardPlayer > .95) blame = 'ai';
+      else if (playerAhead && alongClosing > .35) blame = 'ai';
+      else if (!playerAhead && alongClosing > 1.1 && aiTowardPlayer < .6) blame = 'player';
+    }
+
+    // If the player was not at fault they may get shoved wide. Give them a
+    // grace window; if they leave the road during it, the whole excursion is
+    // treated as a push-off and no track-limits penalty is applied.
+    if (blame !== 'player') {
+      player.trackLimitGrace = Math.max(player.trackLimitGrace, 3.4);
+      player.pushedOffTimer = Math.max(player.pushedOffTimer, 3.4);
+      player.offTrackTimer = 0;
+    }
 
     // Always separate the bodywork, even while the contact cooldown is running.
     player.pos.x += nx * overlap * .5;
@@ -4525,10 +4610,6 @@ function handleCarCollisions(dt) {
         applyDamage(entry, baseDamage);
         emitImpactDebris(midpoint, s, side, 6);
         showToast(`REAR CONTACT  ·  ${Math.round(baseDamage * .8)}% DAMAGE`, 1.5);
-        if (entry.penaltyCooldown <= 0) {
-          giveTimePenalty(entry, 3, 'CAUSING A COLLISION');
-          entry.penaltyCooldown = 5;
-        }
       } else {
         // The player runs into the back of the AI: player is the rear car.
         bumpPlayer(alongClosing);
@@ -4539,11 +4620,8 @@ function handleCarCollisions(dt) {
         applyDamage(entry, baseDamage * .8);
         emitImpactDebris(midpoint, s, -side, 6);
         showToast(`REAR CONTACT  ·  ${Math.round(baseDamage)}% DAMAGE`, 1.5);
-        if (player.penaltyCooldown <= 0) {
-          giveTimePenalty(player, 3, 'CAUSING A COLLISION');
-          player.penaltyCooldown = 5;
-        }
       }
+      penalizeContact(entry, blame, true);
       audio.crash(clamp(impact / 34, .3, .85));
       flashScreen(true);
       player.cameraShake = Math.max(player.cameraShake, .62 + strength * .35);
@@ -4571,17 +4649,7 @@ function handleCarCollisions(dt) {
       player.collisionCooldown = .7;
       entry.collisionCooldown = .7;
       showToast(`SIDE CONTACT  ·  +${Math.round(dmg * .7)}% DAMAGE`, 1.3);
-      // Blame the car that is actually behind and closing. If the AI is the
-      // one hitting us from behind, only the AI gets the penalty.
-      if (playerAhead) {
-        if (alongClosing > .3 && entry.penaltyCooldown <= 0) {
-          giveTimePenalty(entry, 2, 'CAUSING A COLLISION');
-          entry.penaltyCooldown = 5;
-        }
-      } else if (inward < -1.8 && impact > 2.2 && player.penaltyCooldown <= 0) {
-        giveTimePenalty(player, 1.5, 'CONTACT');
-        player.penaltyCooldown = 3;
-      }
+      penalizeContact(entry, blame, false);
     }
   }
   if (player.pos.distanceToSquared(player.car.root.position) > 0) {
@@ -4642,6 +4710,9 @@ function resetPlayerToTrack() {
   player.speed = 0;
   player.forwardSpeed = 0;
   player.sampleIndex = s.i;
+  player.lateral = 0;
+  player.latVel = 0;
+  player.prevLateral = 0;
   const uRel = ((s.u - track.startU) % 1 + 1) % 1;
   player.uRel = uRel;
   player.prevURel = uRel;
@@ -4650,6 +4721,8 @@ function resetPlayerToTrack() {
   player.offTrackTimer = 0;
   player.trackLimitCooldown = 0;
   player.trackLimitGrace = 0;
+  player.pushedOffTimer = 0;
+  player.pushedOff = false;
   player.cameraShake = .25;
   player.car.root.position.copy(player.pos);
   player.car.root.rotation.y = player.heading;
@@ -5306,10 +5379,12 @@ function renderFinishStandings() {
     row.className = 'standing-row' + (r === player ? ' me' : '');
     const status = r.finished && r.finishTime != null ? formatTime(r.finishTime) : 'RUNNING';
     const timeClass = status === 'RUNNING' ? 'sr-time running' : 'sr-time';
+    const penalty = r.penaltyTime || 0;
+    const penaltyBadge = penalty > 0 ? `<em class="sr-pen">+${penalty.toFixed(1)}s</em>` : '';
     row.innerHTML = `
       <span class="sr-pos">${i + 1}</span>
       <i style="background:#${r.primary.toString(16).padStart(6, '0')}"></i>
-      <span class="sr-name">${r.name}${r === player ? '<em>YOU</em>' : ''}</span>
+      <span class="sr-name">${r.name}${r === player ? '<em>YOU</em>' : ''}${penaltyBadge}</span>
       <span class="sr-team">${r.team}</span>
       <span class="${timeClass}">${status}</span>`;
     list.appendChild(row);
